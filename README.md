@@ -1,3 +1,3 @@
-# Zen_Cart-Batch_Order_Update
+# Zen Cart - Batch Order Update
 
 Use the V157 branch.
