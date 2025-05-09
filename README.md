@@ -1,8 +1,6 @@
 # Zen Cart - Batch Order Update
 
-For Zen Cart 1.5.7.
-It was developed in ZC158 and I hope to get it added into the core.
-Meanwhile it is thrown out here for the community to test and improve. So there may be bugs...
+This branch is for Zen Cart 1.5.8.
 
 This mod is for the Admin, Order listing page. It is multi-language.
 
@@ -25,7 +23,7 @@ As always, do not blindly copy anything: compare and merge all files.
 Modifications to the order listing to add the checkboxes are cleanly done by the observer.
 
 order.php
-Modifications are extensive and so need careful merging. A copy of the original 157 is included to facilitate the comparison. You can delete it later, but it does no harm and is useful.
+Modifications are extensive and so need careful merging. A copy of the 158 file used as base is included to facilitate the comparison, since it is currently a moving target. You can delete it later, but it does no harm and is useful.
 
 languages/english/order.php
 Needs to be merged as there are modifications and extra constants.
