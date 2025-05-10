@@ -1,0 +1,23 @@
+/**
+ * Plugin Batch Order Update
+ * @link https://github.com/torvista/Zen_Cart-Batch_Order_Update
+ * @license http://www.zen-cart.com/license/2_0.txt GNU Public License V2.0
+ * @author torvista
+ * @version 9 May 2025 torvista
+ */
+
+#batchOrderUpdate {
+    margin-top: 10px;
+    padding: 5px;
+    border:grey solid 1px;
+}
+#statusUpdateSelectBatch {
+    font-size: small;
+}
+#batchSelectAll{
+    margin-right: 5px;
+}
+#batchSendEmail{}
+#batchStatusUpdateSubmit{
+    margin-top:10px;
+}
