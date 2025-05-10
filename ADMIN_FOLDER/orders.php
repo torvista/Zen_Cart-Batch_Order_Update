@@ -1,22 +1,37 @@
-<?php // plugin Batch Order Update (based on ZC158)
+<?php
 /**
- * @copyright Copyright 2003-2021 Zen Cart Development Team
+ * Plugin Batch Order Update
+ * @link https://github.com/torvista/Zen_Cart-Batch_Order_Update
+ * @license http://www.zen-cart.com/license/2_0.txt GNU Public License V2.0
+ * @author torvista
+ * @version 9 May 2025 torvista
+ */
+
+/**
+ * @copyright Copyright 2003-2024 Zen Cart Development Team
  * @copyright Portions Copyright 2003 osCommerce
  * @license http://www.zen-cart.com/license/2_0.txt GNU Public License V2.0
- * @version $Id:  Modified in v1.5.8 $
+ * @version $Id: torvista 2024 Oct 07 Modified in v2.1.0 $
  */
 require('includes/application_top.php');
+
+    use Zencart\FileSystem\FileSystem;
+    use Zencart\ResourceLoaders\ModuleFinder;
 
 // unset variable which is sometimes tainted by bad plugins like magneticOne tools
 if (isset($module)) {
   unset($module);
 }
 
-// To override these values, create a file in admin/includes/extra_configures
-if (!isset($quick_view_popover_enabled)) $quick_view_popover_enabled = false;
-if (!isset($includeAttributesInProductDetailRows)) $includeAttributesInProductDetailRows = true;
-if (!isset($show_product_tax)) $show_product_tax = true;
-if (!isset($show_zone_info)) $show_zone_info = true;
+$whois_provider_url = 'https://ipdata.co/%s?utm_source=zen_cart';
+//$whois_provider_url = 'https://whois.domaintools.com/%s';
+
+// Override instructions in:
+// https://docs.zen-cart.com/user/admin/site_specific_overrides/
+$quick_view_popover_enabled = $quick_view_popover_enabled ?? false;
+$includeAttributesInProductDetailRows = $includeAttributesInProductDetailRows ?? true;
+$show_product_tax = $show_product_tax ?? true;
+$show_zone_info = $show_zone_info ?? true;
 
 require(DIR_WS_CLASSES . 'currencies.php');
 $currencies = new currencies();
@@ -34,14 +49,8 @@ if (!isset($_GET['page'])) $_GET['page'] = '';
 include DIR_FS_CATALOG . DIR_WS_CLASSES . 'order.php';
 $show_including_tax = (DISPLAY_PRICE_WITH_TAX === 'true');
 // prepare order-status look-up list
-$orders_status_array = [];
-$orders_status = $db->Execute("SELECT orders_status_id, orders_status_name
-                               FROM " . TABLE_ORDERS_STATUS . "
-                               WHERE language_id = " . (int)$_SESSION['languages_id'] . "
-                               ORDER BY orders_status_id");
-foreach ($orders_status as $status) {
-  $orders_status_array[$status['orders_status_id']] = $status['orders_status_name'];
-}
+$ordersStatus = zen_getOrdersStatuses();
+$orders_status_array = $ordersStatus['orders_status_array'];
 
 $action = ($_GET['action'] ?? '');
 $order_exists = false;
@@ -64,7 +73,7 @@ if (isset($_POST['oID'])) {
 if ($oID) {
   $orders = $db->Execute("SELECT orders_id
                           FROM " . TABLE_ORDERS . "
-                          WHERE orders_id = " . $oID);
+                          WHERE orders_id = " . $oID, 1);
   $order_exists = true;
   if ($orders->RecordCount() <= 0) {
     $order_exists = false;
@@ -104,12 +113,27 @@ switch (NOTIFY_CUSTOMER_DEFAULT) {
         break;
 }
 
-// plugin Batch Order Update
-$batch_status_update_active = isset($_POST['batch_status_update']) || isset($_SESSION['batch_status_update']);
-//if (zen_not_null($action) && $order_exists == true) {
-if (!empty($action) && ($order_exists === true || $batch_status_update_active)) {
-if (!$batch_status_update_active) {
+// bof plugin Batch Order Update 1/10
+// When form batchStatusUpdateForm is submitted, no single oID can be passed as the orders are in an array and have to be processed one by one
+// This clause requires modification to allow the switch to process the new case "batch_update_orders"
+// ZC if (!empty($action) && $order_exists === true) {
+// $_POST['batch_status_update'] is set only on the initial batch form submission
+if (!empty($action) && ($order_exists === true
+        || (!empty($_POST['batch_status_update']) && is_array($_POST['batch_status_update'])))) {
+  if ($order_exists === true) { // This is set above in core code for a normal order update
+// eof plugin Batch Order Update
     $order = new order($oID);
+    $module = false;
+    global $installedPlugins;
+    $moduleFinder = new ModuleFinder('payment', new Filesystem());
+    $modules_found = $moduleFinder->findFromFilesystem($installedPlugins);
+    $payment = ($order->info['payment_module_code'] ?? 'nothing') . '.php';
+    if (array_key_exists($payment, $modules_found) && file_exists(DIR_FS_CATALOG . $modules_found[$payment] . $payment)) {
+        $languageLoader->loadModuleLanguageFile($payment, 'payment');
+        require_once DIR_FS_CATALOG . $modules_found[$payment] . $payment;
+        $module = new $order->info['payment_module_code']();
+    }
+// bof plugin Batch Order Update 2/10
 }
 // eof plugin Batch Order Update
   switch ($action) {
@@ -176,9 +200,6 @@ if (!$batch_status_update_active) {
       // reset single download to on
       if (!empty($_GET['download_reset_on'])) {
         // adjust download_maxdays based on current date
-        $check_status = $db->Execute("SELECT customers_name, customers_email_address, orders_status, date_purchased
-                                      FROM " . TABLE_ORDERS . "
-                                      WHERE orders_id = " . (int)$_GET['oID']);
 
         // check for existing product attribute download days and max
         $chk_products_download_query = "SELECT orders_products_id, orders_products_filename, products_prid
@@ -197,14 +218,14 @@ if (!$batch_status_update_active) {
         $chk_products_download_time = $db->Execute($chk_products_download_time_query);
 
         if ($chk_products_download_time->EOF) {
-          $zc_max_days = (DOWNLOAD_MAX_DAYS == 0 ? 0 : zen_date_diff($check_status->fields['date_purchased'], date('Y-m-d H:i:s')) + DOWNLOAD_MAX_DAYS);
+          $zc_max_days = DOWNLOAD_MAX_DAYS == 0 ? 0 : zen_date_diff($order->info['date_purchased'], date('Y-m-d H:i:s')) + (int)DOWNLOAD_MAX_DAYS;
           $update_downloads_query = "UPDATE " . TABLE_ORDERS_PRODUCTS_DOWNLOAD . "
                                      SET download_maxdays = " . (int)$zc_max_days . ",
                                          download_count = " . (int)DOWNLOAD_MAX_COUNT . "
                                      WHERE orders_id = " . (int)$_GET['oID'] . "
                                      AND orders_products_download_id = " . (int)$_GET['download_reset_on'];
         } else {
-          $zc_max_days = ($chk_products_download_time->fields['products_attributes_maxdays'] == 0 ? 0 : zen_date_diff($check_status->fields['date_purchased'], date('Y-m-d H:i:s')) + $chk_products_download_time->fields['products_attributes_maxdays']);
+          $zc_max_days = ($chk_products_download_time->fields['products_attributes_maxdays'] == 0 ? 0 : zen_date_diff($order->info['date_purchased'], date('Y-m-d H:i:s')) + $chk_products_download_time->fields['products_attributes_maxdays']);
           $update_downloads_query = "UPDATE " . TABLE_ORDERS_PRODUCTS_DOWNLOAD . "
                                      SET download_maxdays = " . (int)$zc_max_days . ",
                                          download_count = " . (int)$chk_products_download_time->fields['products_attributes_maxcount'] . "
@@ -234,55 +255,81 @@ if (!$batch_status_update_active) {
         zen_redirect(zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['action']) . 'action=edit', 'NONSSL'));
       }
       break;
-// plugin Batch Order Update
+// bof plugin Batch Order Update 3/10
         case 'batch_update_orders':
+            $batchDebug1 = false; // Debugging for case 'batch_update_orders' up to first redirect
             $batch_error = false;
             $batch_status_update = [];
+
             if ($_POST['statusUpdateSelectBatch']==='') {
                 $batch_error = true;
-                $messageStack->add_session(TEXT_BATCH_NO_STATUS_SELECTED);
+                $messageStack->add_session(BATCH_TEXT_NO_STATUS_SELECTED);
             }
             if (empty($_POST['batch_status_update'])) {
                 $batch_error = true;
-                $messageStack->add_session(TEXT_BATCH_NO_CHECKBOX_SELECTED);
+                $messageStack->add_session(BATCH_TEXT_NO_CHECKBOX_SELECTED);
             }
-            if ($batch_error) { // new status not selected or no checkbox checked: should have been trapped by javascript already
+
+            // A new order status was not selected or no order checkbox was checked: but this should have been trapped by javascript already
+            if ($batch_error) {
                 $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['action']), 'NONSSL');
+
             } else {
-                // get order language and group them per language
+                if ($batchDebug1) {
+                    echo __LINE__;
+                    mv_printVar($_POST['batch_status_update']);
+                }
+
+                // get order language and group them per language to process one language/multiple orders at a time
                 foreach ($_POST['batch_status_update'] as $batch_order_id) {
                     $result = $db->Execute("SELECT language_code FROM " . TABLE_ORDERS . " WHERE orders_id = " . (int) $batch_order_id . " LIMIT 1");
                     $batch_status_update[$result->fields['language_code']][] = $batch_order_id;
                 }
-                // if any orders use the current admin language, put this language first in the array to avoid an unnecessary initial redirect
+                if ($batchDebug1) {
+                    echo __LINE__;
+                    mv_printVar($_POST['batch_status_update']);
+                }
+
+                // If any orders use the currently-selected admin language, put this language first in the array to avoid an unnecessary initial redirect
                 if (isset($batch_status_update[$_SESSION['languages_code']])) {
                     $batch_status_update = array_merge([$_SESSION['languages_code'] => $batch_status_update[$_SESSION['languages_code']]], $batch_status_update);
                 }
-                $_SESSION['batch_status_update'] = $batch_status_update; // orders to update
-                $_SESSION['admin_language'] = $_POST['admin_language']; // initial admin language when batch update initiated
-                $_SESSION['notify_batch'] = !empty($_POST['notify_batch']) ? (int) $_POST['notify_batch']:0; // notify customers by email?
+
+                $_SESSION['batch_status_update'] = $batch_status_update; // list of orders to update
+                $_SESSION['admin_language'] = $_POST['admin_language']; // the admin language in use BEFORE the batch update was initiated: need to re-establish this language when the batch update is completed
+                $_SESSION['notify_batch'] = !empty($_POST['notify_batch']) ? (int) $_POST['notify_batch'] : 0; // notify customers by email?
                 $_SESSION['statusUpdateSelectBatch'] = (int) $_POST['statusUpdateSelectBatch']; // new status for all batch orders
-                $_SESSION['messageToStackBatch'] = []; // storage for multiple order-update and email-sent messages, to be displayed on batch completion
+                $_SESSION['messageToStackBatch'] = []; // storage for multiple order-update and email-sent messages: to be displayed on batch completion
                 $order_language = key($_SESSION['batch_status_update']);
-                $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['action', 'language']) . 'action=update_order' . '&language=' . $order_language, 'NONSSL');
+                $oID = (int)($_SESSION['batch_status_update'][$order_language][0]); // Get the first order id to pass to 'update_order' as normal
+                if ($batchDebug1) {
+                    echo __LINE__ . ': $oID=' . $oID;
+                    mv_printVar($_SESSION['batch_status_update']);
+                    die;
+                }
+                $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['action', 'language']) . 'action=update_order' . '&oID=' . $oID . '&language=' . $order_language, 'NONSSL');
             }
             zen_redirect($redirect);
             break;
-//eof batch update
+// eof plugin Batch Order Update
     case 'update_order':
-// plugin Batch Order Update
-          if (isset($_SESSION['batch_status_update']) && is_array($_SESSION['batch_status_update']) && count($_SESSION['batch_status_update']) > 0) {
-              $_POST['admin_language'] = $_SESSION['admin_language']; // set admin language var for standard processing
-              $order_language = key($_SESSION['batch_status_update']); // get language of first set of orders
-              if ($_SESSION['languages_code']!==$order_language) { // language of first set of orders is different to current admin language->enter this switch-case again with the correct order language
-                  $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['language']) . '&language=' . $order_language, 'NONSSL');
-              }
-              $_POST['statusUpdateSelect'] = $_SESSION['statusUpdateSelectBatch']; // set new status for batch update
-              $_POST['notify'] = $_SESSION['notify_batch']; // set email notify for batch update
-              $_GET['oID'] = array_shift($_SESSION['batch_status_update'][$order_language]); // get order to process and remove from batch list
-          }
-//eof batch status update
-      $oID = zen_db_prepare_input($_GET['oID']);
+// bof plugin Batch Order Update 4/10
+            $batchDebug2 = false;  // Debugging for case 'update_order'
+            if (!empty($_SESSION['batch_status_update']) && is_array($_SESSION['batch_status_update'])) {
+                if ($batchDebug2) {
+                    echo __LINE__ . ': $oID=' . $oID;
+                    mv_printVar($_SESSION['batch_status_update']);
+                }
+                $_POST['admin_language'] = $_SESSION['admin_language']; // set admin language var for standard processing
+                $order_language = key($_SESSION['batch_status_update']); // get language of current order
+                if ($_SESSION['languages_code'] !== $order_language
+                ) { // this order's language is different to the current admin language -> redirect with the corresponding order language to enter this switch-case again
+                    $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['language']) . '&language=' . $order_language, 'NONSSL');
+                }
+                $_POST['statusUpdateSelect'] = $_SESSION['statusUpdateSelectBatch']; // set new status for batch update
+                $_POST['notify'] = $_SESSION['notify_batch']; // set email notify for batch update
+            }
+// eof plugin Batch Order Update
       $comments = !empty($_POST['comments']) ? zen_db_prepare_input($_POST['comments']) : '';
       $admin_language = zen_db_prepare_input($_POST['admin_language'] ?? $_SESSION['languages_code']);
       $status = (int)$_POST['statusUpdateSelect'];
@@ -303,19 +350,14 @@ if (!$batch_status_update_active) {
       $status_updated = zen_update_orders_history($oID, $comments, null, $status, $customer_notified, $email_include_message);
       $order_updated = ($status_updated > 0);
 
-      $check_status = $db->ExecuteNoCache("SELECT customers_name, customers_email_address, orders_status, date_purchased
-                                    FROM " . TABLE_ORDERS . "
-                                    WHERE orders_id = " . $oID
-                                    );
-
       // trigger any appropriate updates which should be sent back to the payment gateway:
       if ($order->info['payment_module_code']) {
         if (file_exists(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php')) {
           require_once(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php');
-          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline'); 
+          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline');
           $module = new $order->info['payment_module_code']();
           if (method_exists($module, '_doStatusUpdate')) {
-            $response = $module->_doStatusUpdate($oID, $status, $comments, $customer_notified, $check_status->fields['orders_status']);
+            $response = $module->_doStatusUpdate($oID, $status, $comments, $customer_notified, $order->info['orders_status']);
           }
         }
       }
@@ -342,14 +384,14 @@ if (!$batch_status_update_active) {
             $chk_products_download_time = $db->Execute($chk_products_download_time_query);
 
             if ($chk_products_download_time->EOF) {
-              $zc_max_days = (DOWNLOAD_MAX_DAYS == 0 ? 0 : zen_date_diff($check_status->fields['date_purchased'], date('Y-m-d H:i:s')) + DOWNLOAD_MAX_DAYS);
+              $zc_max_days = DOWNLOAD_MAX_DAYS == 0 ? 0 : zen_date_diff($order->info['date_purchased'], date('Y-m-d H:i:s')) + (int)DOWNLOAD_MAX_DAYS;
               $update_downloads_query = "UPDATE " . TABLE_ORDERS_PRODUCTS_DOWNLOAD . "
                                          SET download_maxdays = " . (int)$zc_max_days . ",
                                              download_count = " . (int)DOWNLOAD_MAX_COUNT . "
                                          WHERE orders_id = " . $oID . "
                                          AND orders_products_download_id = " . (int)$_GET['download_reset_on'];
             } else {
-              $zc_max_days = ($chk_products_download_time->fields['products_attributes_maxdays'] == 0 ? 0 : zen_date_diff($check_status->fields['date_purchased'], date('Y-m-d H:i:s')) + $chk_products_download_time->fields['products_attributes_maxdays']);
+              $zc_max_days = ($chk_products_download_time->fields['products_attributes_maxdays'] == 0 ? 0 : zen_date_diff($order->info['date_purchased'], date('Y-m-d H:i:s')) + $chk_products_download_time->fields['products_attributes_maxdays']);
               $update_downloads_query = "UPDATE " . TABLE_ORDERS_PRODUCTS_DOWNLOAD . "
                                          SET download_maxdays = " . (int)$zc_max_days . ",
                                              download_count = " . (int)$chk_products_download_time->fields['products_attributes_maxcount'] . "
@@ -360,52 +402,91 @@ if (!$batch_status_update_active) {
             $db->Execute($update_downloads_query);
           }
         }
-// plugin Batch Order Update
-      //$messageStack->add_session(SUCCESS_ORDER_UPDATED, 'success');
+// bof plugin Batch Order Update 5/10
+      //ZC $messageStack->add_session(SUCCESS_ORDER_UPDATED, 'success');
         $messageStack->add_session(sprintf(SUCCESS_ORDER_UPDATED, '#' . $oID), 'success');
 // eof plugin Batch Order Update
           if ($customer_notified === 1) {
-// plugin Batch Order Update
-            //$messageStack->add_session(sprintf(SUCCESS_EMAIL_SENT, ($admin_language !== $_SESSION['languages_code'] ? '(' . strtoupper($_SESSION['languages_code']) . ') ' : '')), 'success'); // show an email sent confirmation message, with a language indicator if the order/email language was different to the admin user language
-              $messageStack->add_session(sprintf(SUCCESS_EMAIL_SENT, ($admin_language !== $_SESSION['languages_code'] ? ' (' . strtoupper($_SESSION['languages_code']) . ')' : ''), '#' . $oID), 'success'); // show an email sent confirmation message, with a language indicator if the order/email language was different to the admin user language
+// bof plugin Batch Order Update 6/10
+            //original $messageStack->add_session(sprintf(SUCCESS_EMAIL_SENT, ($admin_language !== $_SESSION['languages_code'] ? '(' . strtoupper($_SESSION['languages_code']) . ') ' : '')), 'success');
+              // show an email sent confirmation message, with a language indicator if the order/email language was different to the admin user language
+              $messageStack->add_session(sprintf(SUCCESS_EMAIL_SENT, ($admin_language !== $_SESSION['languages_code'] ? ' (' . strtoupper($_SESSION['languages_code']) . ')' : ''), '#' . $oID), 'success'); // show an email-sent confirmation message, with a language indicator if the order/email language was different to the admin user language
 // eof plugin Batch Order Update
           }
         zen_record_admin_activity('Order ' . $oID . ' updated.', 'info');
       } else {
 // plugin Batch Order Update
-      //$messageStack->add_session(WARNING_ORDER_NOT_UPDATED, 'warning');
+      //ZC $messageStack->add_session(WARNING_ORDER_NOT_UPDATED, 'warning');
         $messageStack->add_session(sprintf(WARNING_ORDER_NOT_UPDATED, '#' . $oID), 'warning');
 // eof plugin Batch Order Update
       }
-// plugin Batch Order Update
-          if (isset($_SESSION['batch_status_update']) && is_array($_SESSION['batch_status_update']) && count($_SESSION['batch_status_update']) > 0) {
-              foreach ($_SESSION['messageToStack'] as $message) { // get messages
-                  $_SESSION['messageToStackBatch'][] = $message;
-              }
-              $_SESSION['messageToStack'] = ''; //clear messageStack
-              if (count($_SESSION['batch_status_update'][$order_language])===0) { // if no orders left for this language, delete this language key
-                  array_shift($_SESSION['batch_status_update']);
-              }
-              if (count($_SESSION['batch_status_update'])===0) { // if no languages/orders left to process
-                  $_SESSION['messageToStack'] = $_SESSION['messageToStackBatch']; // load batch messages into core messagestack array
-                  unset($_SESSION['batch_status_update'], $_SESSION['messageToStackBatch'], $_SESSION['admin_language'], $_SESSION['notify_batch'], $_SESSION['statusUpdateSelectBatch']); // delete session arrays
-              }
-          }
-          if (isset($_SESSION['batch_status_update']) && is_array($_SESSION['batch_status_update'])) { // there are more batch orders to process->redirect back to this switch-case
-              $order_language = key($_SESSION['batch_status_update']);
-              $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['language']) . '&language=' . $order_language, 'NONSSL');
-          } else {
+
+// bof plugin Batch Order Update 7/10
+            if (!empty($_SESSION['batch_status_update']) && is_array($_SESSION['batch_status_update'])) {
+                if ($batchDebug2) {
+                    echo __LINE__;
+                    mv_printVar($_SESSION['batch_status_update']);
+                }
+                //load the new messageStack messages into the batch message array for temporary storage during batch processing
+                foreach ($_SESSION['messageToStack'] as $message) { // get messages
+                    $_SESSION['messageToStackBatch'][] = $message;
+                }
+                $_SESSION['messageToStack'] = ''; //clear core messageStack for next batch order
+
+                array_shift($_SESSION['batch_status_update'][$_SESSION['languages_code']]);//delete current order ID
+
+                $batch_continue = true;
+                if (count($_SESSION['batch_status_update'][$_SESSION['languages_code']]) === 0) { // if no orders left for this language, delete this language key
+                    array_shift($_SESSION['batch_status_update']);
+                    if ($batchDebug2) {
+                        echo __LINE__;
+                        mv_printVar($_SESSION['batch_status_update']);
+                    }
+
+                    if (count($_SESSION['batch_status_update']) === 0) { // its all over!
+                        $batch_continue = false;
+                    } else {
+                        //there are more orders of another language
+                    }
+                } else {
+                    //there are more orders of this language
+                }
+
+                if ($batch_continue) { // there are more batch orders to process->redirect back to this switch-case
+                    if ($batchDebug2) {
+                        echo __LINE__;
+                        mv_printVar($_SESSION['batch_status_update']);
+                    }
+                    $order_language = key($_SESSION['batch_status_update']);
+                    $oID = (int)($_SESSION['batch_status_update'][$order_language][0]);//get next id to pass to 'update_order' as normal
+
+                    zen_redirect(zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['language', 'oID']) . '&oID=' . $oID . '&language=' . $order_language, 'NONSSL'));
+
+                } else {
+                    // if (count($_SESSION['batch_status_update'])===0) { // if no languages/orders left to process
+                    $_SESSION['messageToStack'] = $_SESSION['messageToStackBatch']; // load batch messages into core messagestack array
+                    unset($_SESSION['batch_status_update'], $_SESSION['messageToStackBatch'], $_SESSION['admin_language'], $_SESSION['notify_batch'], $_SESSION['statusUpdateSelectBatch']); // delete session arrays
+                    // }
+                }
+            }
+            if ($batchDebug2) {
+                echo __LINE__;
+                if (empty($_SESSION['batch_status_update'])) {
+                    echo '$_SESSION[\'batch_status_update\'] empty';
+                } else {
+                    mv_printVar($_SESSION['batch_status_update']);
+                }
+            }
+// eof plugin Batch Order Update
         $redirect = zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['action', 'language']) . ($admin_language !== $_SESSION['languages_code'] ? '&language=' . $admin_language : ''), 'NONSSL');
         if (isset($_POST['camefrom']) && $_POST['camefrom'] === 'orderEdit') {
             $redirect .= '&action=edit';
         }
-}
-// eof plugin Batch Order Update
         zen_redirect($redirect);
       break;
 
     case 'deleteconfirm':
-      zen_remove_order($oID, $_POST['restock']);
+      zen_remove_order($oID, (!empty($_POST['restock']) && $_POST['restock'] === 'on'));
 
       zen_redirect(zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID', 'action']), 'NONSSL'));
       break;
@@ -416,10 +497,7 @@ if (!$batch_status_update_active) {
       zen_redirect(zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['action']) . 'action=edit', 'NONSSL'));
       break;
     case 'mask_cc':
-      $result = $db->Execute("SELECT cc_number
-                              FROM " . TABLE_ORDERS . "
-                              WHERE orders_id = " . (int)$_GET['oID']);
-      $old_num = $result->fields['cc_number'];
+      $old_num = $order->info['cc_number'];
       $new_num = substr($old_num, 0, 4) . str_repeat('*', (strlen($old_num) - 8)) . substr($old_num, -4);
       $mask_cc = $db->Execute("UPDATE " . TABLE_ORDERS . "
                                SET cc_number = '" . $new_num . "'
@@ -431,7 +509,7 @@ if (!$batch_status_update_active) {
       if ($order->info['payment_module_code']) {
         if (file_exists(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php')) {
           require_once(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php');
-          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline'); 
+          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline');
           $module = new $order->info['payment_module_code']();
           if (method_exists($module, '_doRefund')) {
             $module->_doRefund($oID);
@@ -445,7 +523,7 @@ if (!$batch_status_update_active) {
       if ($order->info['payment_module_code']) {
         if (file_exists(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php')) {
           require_once(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php');
-          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline'); 
+          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline');
           $module = new $order->info['payment_module_code']();
           if (method_exists($module, '_doAuth')) {
             $module->_doAuth($oID, $order->info['total'], $order->info['currency']);
@@ -458,7 +536,7 @@ if (!$batch_status_update_active) {
       if ($order->info['payment_module_code']) {
         if (file_exists(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php')) {
           require_once(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php');
-          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline'); 
+          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline');
           $module = new $order->info['payment_module_code']();
           if (method_exists($module, '_doCapt')) {
             $module->_doCapt($oID, 'Complete', $order->info['total'], $order->info['currency']);
@@ -471,7 +549,7 @@ if (!$batch_status_update_active) {
       if ($order->info['payment_module_code']) {
         if (file_exists(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php')) {
           require_once(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php');
-          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline'); 
+          zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline');
           $module = new $order->info['payment_module_code']();
           if (method_exists($module, '_doVoid')) {
             $module->_doVoid($oID);
@@ -529,7 +607,7 @@ if (!$batch_status_update_active) {
     echo $extra_top_content;
 ?>
 
-      <?php $order_list_button = '<a role="button" class="btn btn-default" href="' . zen_href_link(FILENAME_ORDERS) . '"><i class="fa fa-th-list" aria-hidden="true">&nbsp;</i> ' . BUTTON_TO_LIST . '</a>'; ?>
+      <?php $order_list_button = '<a role="button" class="btn btn-default" href="' . zen_href_link(FILENAME_ORDERS) . '"><i class="fa-solid fa-table-list" aria-hidden="true">&nbsp;</i> ' . BUTTON_TO_LIST . '</a>'; ?>
       <?php if ($action === '') { ?>
         <!-- search -->
 
@@ -547,7 +625,7 @@ if (!$batch_status_update_active) {
                   if (!empty($_GET['search']) || !empty($_GET['cID'])) {
                     ?>
                   <a class="btn btn-info input-group-addon" role="button" aria-label="<?php echo TEXT_RESET_FILTER; ?>" href="<?php echo zen_href_link(FILENAME_ORDERS); ?>">
-                    <i class="fa fa-times" aria-hidden="true">&nbsp;</i>
+                    <i class="fa-solid fa-xmark" aria-hidden="true">&nbsp;</i>
                   </a>
                 <?php } ?>
               </div>
@@ -565,7 +643,7 @@ if (!$batch_status_update_active) {
                   if (!empty($_GET['search_orders_products']) || !empty($_GET['cID'])) {
                     ?>
                   <a class="btn btn-info input-group-addon" role="button" aria-label="<?php echo TEXT_RESET_FILTER; ?>" href="<?php echo zen_href_link(FILENAME_ORDERS); ?>">
-                    <i class="fa fa-times" aria-hidden="true">&nbsp;</i>
+                    <i class="fa-solid fa-xmark" aria-hidden="true">&nbsp;</i>
                   </a>
                 <?php } ?>
               </div>
@@ -586,28 +664,30 @@ if (!$batch_status_update_active) {
                 echo zen_draw_form('statusFilterForm', FILENAME_ORDERS, '', 'get', '', true);
                 echo zen_draw_label(HEADING_TITLE_STATUS, 'statusFilterSelect', 'class="sr-only"');
                 echo zen_draw_order_status_dropdown('statusFilterSelect', (int)$_GET['statusFilterSelect'], ['id' => '', 'text' => TEXT_ALL_ORDERS], 'class="form-control" onChange="this.form.submit();" id="statusFilterSelect"');
-// plugin Batch Order Update help block ?>
-                <span class="help-block"><?php echo HEADING_TITLE_STATUS_DETAIL; ?></span><?php
                 echo '</form>';
                 ?>
-                <?php // plugin Batch Order Update
-                //if (!empty($_GET['status'])) {
+<?php
+// bof plugin Batch Order Update 8/10
                 if (!empty($_GET['statusFilterSelect'])) {
                     ?>
-                    <div style="border:grey solid 1px;padding:5px;">
-                        <span class="help-block"><?php echo HEADING_TITLE_BATCH_STATUS_DETAIL; ?></span>
-                        <?php
-                        echo zen_draw_label(HEADING_TITLE_STATUS, 'statusUpdateSelectBatch', 'class="sr-only"');
-                        // replace stock function
-                        //echo zen_draw_order_status_dropdown('statusUpdateSelectBatch', (!empty($_SESSION['statusUpdateSelectBatch']) ? (int) $_SESSION['statusUpdateSelectBatch']:''), array('id' => '', 'text' => TEXT_SELECT_NEW_STATUS), 'class="form-control" id="statusUpdateSelectBatch" form="batchStatusUpdateForm"', $_GET['statusFilterSelect']);
-                        echo btc_draw_order_status_dropdown('statusUpdateSelectBatch', (!empty($_SESSION['statusUpdateSelectBatch']) ? (int) $_SESSION['statusUpdateSelectBatch']:''), ['id' => '', 'text' => TEXT_SELECT_NEW_STATUS], 'class="form-control" id="statusUpdateSelectBatch" form="batchStatusUpdateForm"', $_GET['statusFilterSelect']);
-                          // eof plugin Batch Order Update ?>
-                        <br>
-                        <label><?php echo TEXT_BATCH_SELECT_ALL; ?> <?php echo zen_draw_checkbox_field('select_all', 1, false, '', 'id="batchSelectAll"'); ?></label>
-                        <label><?php echo IMAGE_SEND_EMAIL; ?> <?php echo zen_draw_checkbox_field('notify_batch', 1, (!empty($_SESSION['notify_batch']) ? (int) $_SESSION['notify_batch']:$notify_email), '', 'form="batchStatusUpdateForm"'); ?></label><br>
-                        <input value="<?php echo TEXT_BATCH_STATUS_UPDATE; ?>" type="submit" form="batchStatusUpdateForm" id="batchStatusUpdateSubmit">
+                    <div id="batchOrderUpdate">
+                        <h4 style="margin-top:0;"><?= BATCH_HEADING_TITLE ?></h4>
+                        <label><?= BATCH_TEXT_SELECT_NEW_STATUS ?>:
+                        <?= batch_draw_order_status_dropdown(
+                            'statusUpdateSelectBatch',
+                            (!empty($_SESSION['statusUpdateSelectBatch']) ? (int)$_SESSION['statusUpdateSelectBatch'] : ''),
+                            ['id' => '', 'text' => TABLE_HEADING_STATUS],
+                            'id="statusUpdateSelectBatch" form="batchStatusUpdateForm" class="form-control"',
+                            $_GET['statusFilterSelect']
+                        ); ?></label>
+                        <label><?= BATCH_TEXT_SELECT_ALL ?> <?= zen_draw_checkbox_field('select_all', 1, false, '', 'id="batchSelectAll"') ?></label>
+                        <label><?= IMAGE_SEND_EMAIL; ?> <?= zen_draw_checkbox_field('notify_batch', 1, (!empty($_SESSION['notify_batch']) ? (int)$_SESSION['notify_batch'] : $notify_email), '', 'form="batchStatusUpdateForm" id="batchSendEmail"'); ?></label>
+                        <input id="batchStatusUpdateSubmit" value="<?= BATCH_TEXT_STATUS_UPDATE ?>" type="submit" form="batchStatusUpdateForm">
                     </div>
-                <?php } // eof plugin Batch Order Update ?>
+                <?php
+                }
+// eof plugin Batch Order Update
+ ?>
             </div>
           </div>
         </div>
@@ -617,14 +697,33 @@ if (!$batch_status_update_active) {
 
       <?php
       if ($action === 'edit' && $order_exists) {
-        $order = new order($oID);
         $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_EDIT_BEGIN', $oID, $order);
-        if ($order->info['payment_module_code']) {
-          if (file_exists(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php')) {
-            require(DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php');
-            zen_include_language_file($order->info['payment_module_code'] . '.php', '/modules/payment/','inline'); 
+        if ($order->info['payment_module_code'] && $order->info['payment_module_code'] !== PAYMENT_MODULE_GV) {
+          $messageStack->reset();
+          $payment_module = DIR_FS_CATALOG_MODULES . 'payment/' . $order->info['payment_module_code'] . '.php';
+          global $installedPlugins;
+            $moduleFinder = new ModuleFinder('payment', new Filesystem());
+            $modules_found = $moduleFinder->findFromFilesystem($installedPlugins);
+            $payment = $order->info['payment_module_code'] . '.php';
+            if (array_key_exists($payment, $modules_found) && file_exists(DIR_FS_CATALOG . $modules_found[$payment] . $payment)) {
+                $payment_module = DIR_FS_CATALOG . $modules_found[$payment] . $payment;
+            }
+
+          if (!file_exists($payment_module)) {
+              $messageStack->add(sprintf(WARNING_PAYMENT_MODULE_DOESNT_EXIST, $order->info['payment_module_code']), 'warning');
+          } else {
+            require $payment_module;
+            $languageLoader->loadModuleLanguageFile($payment, 'payment');
             $module = new $order->info['payment_module_code']();
+            if ((is_object($module) && method_exists($module, 'admin_notification')) && !$module->enabled) {
+                $messageStack->add(sprintf(WARNING_PAYMENT_MODULE_NOTIFICATIONS_DISABLED, $order->info['payment_module_code']), 'warning');
+            }
 //        echo $module->admin_notification($oID);
+          }
+          if ($messageStack->size !== 0) {
+?>
+        <div class="messageStack-header noprint"><?php echo $messageStack->output(); ?></div><br>
+<?php
           }
         }
 
@@ -660,7 +759,7 @@ if (!$batch_status_update_active) {
           <div class="col-sm-3 col-lg-4 text-left noprint">
             <?php echo $left_side_buttons; ?>
           </div>
-          <div class="col-sm-6 col-lg-6 noprint">
+          <div class="col-sm-6 col-lg-4 noprint">
             <div class="input-group">
               <span class="input-group-btn">
                   <?php echo $prev_button; ?>
@@ -674,7 +773,7 @@ if (!$batch_status_update_active) {
               <div class="input-group-btn">
                 <?php echo $next_button; ?>
                 <?php echo $order_list_button; ?>
-                <button type="button" class="btn btn-default" onclick="history.back()"><i class="fa fa-undo" aria-hidden="true">&nbsp;</i> <?php echo IMAGE_BACK; ?></button>
+                <button type="button" class="btn btn-default" onclick="history.back()"><i class="fa-solid fa-arrow-rotate-left" aria-hidden="true">&nbsp;</i> <?php echo IMAGE_BACK; ?></button>
               </div>
             </div>
           </div>
@@ -685,28 +784,39 @@ if (!$batch_status_update_active) {
         <div class="row noprint"><?php echo zen_draw_separator(); ?></div>
         <div class="row">
           <div class="col-sm-4">
-            <table class="table">
+            <table class="table" id="addressCustomer">
               <tr>
-                <td><strong><?php echo ENTRY_CUSTOMER_ADDRESS; ?></strong></td>
+                <td><strong><?php echo ENTRY_CUSTOMER_ADDRESS; ?></strong><br>
+                    <button type="button" class="btn btn-xs btn-default mt-3" title="<?= TEXT_COPY ?>" onclick="copyToClipboard('customer', this)"><?= TEXT_COPY ?></button>
+                </td>
                 <td><?php echo zen_address_format($order->customer['format_id'], $order->customer, 1, '', '<br>'); ?></td>
               </tr>
               <tr>
                 <td>&nbsp;</td>
-                <td class="noprint"><a href="https://maps.google.com/maps/search/?api=1&amp;query=<?php echo urlencode($order->customer['street_address'] . ',' . $order->customer['city'] . ',' .  $order->customer['state'] . ',' . $order->customer['postcode']); ?>" rel="noreferrer" target="map"><i class="fa fa-map">&nbsp;</i> <u><?php echo TEXT_MAP_CUSTOMER_ADDRESS; ?></u></a></td>
+                <td class="noprint"><a href="https://maps.google.com/maps/search/?api=1&amp;query=<?php echo urlencode($order->customer['street_address'] . ',' . $order->customer['city'] . ',' .  $order->customer['state'] . ',' . $order->customer['postcode']); ?>" rel="noreferrer" target="map"><i class="fa-regular fa-map">&nbsp;</i> <u><?php echo TEXT_MAP_CUSTOMER_ADDRESS; ?></u></a></td>
               </tr>
-<?php
-  $address_footer_suffix = '';
-  $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_ADDRESS_FOOTERS', 'customer', $address_footer_suffix, $order->customer);
-  if (!empty($address_footer_suffix)) {
-  ?>
-                <tr><td>&nbsp;</td><td><?php echo $address_footer_suffix; ?></td></tr>
-<?php } ?>
-              <tr class="noprint">
-                <td colspan="2"><?php echo zen_draw_separator('pixel_trans.gif', '1', '5'); ?></td>
-              </tr>
+                <?php
+                $address_footer_suffix = '';
+                $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_ADDRESS_FOOTERS', 'customer', $address_footer_suffix, $order->customer);
+                if (is_array($address_footer_suffix)) {
+                    foreach ($address_footer_suffix as $label => $data) {
+                        ?>
+                        <tr>
+                            <td><strong><?= $label ?></td>
+                            <td><?= $data ?></td>
+                        </tr>
+                        <?php
+                    }
+                } elseif (!empty($address_footer_suffix)) { ?>
+                    <tr>
+                        <td>&nbsp;</td>
+                        <td><?= $address_footer_suffix ?></td>
+                    </tr>
+                <?php
+                } ?>
               <tr>
                 <td><strong><?php echo ENTRY_TELEPHONE_NUMBER; ?></strong></td>
-                <td><a href="tel:<?php echo preg_replace('/\s+/', '', $order->customer['telephone']); ?>"><?php echo $order->customer['telephone']; ?></a></td>
+                <td><a href="tel:<?php echo preg_replace('/\s+/', '', zen_output_string_protected($order->customer['telephone'])); ?>"><?php echo zen_output_string_protected($order->customer['telephone']); ?></a></td>
               </tr>
               <tr>
                 <td><strong><?php echo ENTRY_EMAIL_ADDRESS; ?></strong></td>
@@ -716,60 +826,115 @@ if (!$batch_status_update_active) {
                 <td><strong><?php echo TEXT_INFO_IP_ADDRESS; ?></strong></td>
                 <?php
                 if (!empty($order->info['ip_address'])) {
-                  $lookup_ip = substr($order->info['ip_address'], 0, strpos($order->info['ip_address'], ' '));
-                  $whois_url = 'https://tools.dnsstuff.com/#whois|type=ipv4&&value=' . $lookup_ip;
-                  //$whois_url = 'https://whois.domaintools.com/' . $lookup_ip;
-                  $zco_notifier->notify('ADMIN_ORDERS_IP_LINKS', $lookup_ip, $whois_url);
+                  $ips = explode(' - ', $order->info['ip_address']);
+                  $lookup_ip = $ips[0];
+                  $whois_url = sprintf($whois_provider_url, $lookup_ip);
+                  $lookup_ip2 = $ips[1] ?? '';
+                  $whois_url2 = empty($lookup_ip2) ? '' : sprintf($whois_provider_url, $lookup_ip2);
+                  $zco_notifier->notify('ADMIN_ORDERS_IP_LINKS', $lookup_ip, $whois_url, $whois_provider_url, $lookup_ip2, $whois_url2);
                   ?>
-                  <td class="noprint"><a href="<?php echo $whois_url; ?>" rel="noreferrer noopener" target="_blank"><?php echo $order->info['ip_address']; ?></a></td>
+                  <td class="noprint">
+                      <a href="<?= $whois_url ?>" rel="noreferrer noopener" target="_blank"><?= $lookup_ip ?></a>
+                  <?php if (!empty($lookup_ip2) && $lookup_ip !== $lookup_ip2) { ?> -
+                      <a href="<?= $whois_url2 ?>" rel="noreferrer noopener" target="_blank"><?= $lookup_ip2 ?></a>
+                  <?php } ?>
+                  </td>
                 <?php } else { ?>
                   <td><?php echo TEXT_UNKNOWN; ?></td>
                 <?php } ?>
               </tr>
               <tr>
                 <td class="noprint"><strong><?php echo ENTRY_CUSTOMER; ?></strong></td>
-                <td class="noprint"><?php echo '<a href="' . zen_href_link(FILENAME_CUSTOMERS, 'search=' . $order->customer['email_address'], 'SSL') . '">' . TEXT_CUSTOMER_LOOKUP . '</a>'; ?></td>
+                <td class="noprint">
+                  <?php
+                  if ($order->customer['id'] == 0) {
+                       echo '<a href="' . zen_href_link(FILENAME_CUSTOMERS, 'search=' . $order->customer['email_address'], 'SSL') . '">' . TEXT_CUSTOMER_LOOKUP . '</a>';
+                  } else {
+                       echo '<a href="' . zen_href_link(FILENAME_CUSTOMERS, 'cID=' . $order->customer['id'], 'SSL') . '">' . TEXT_CUSTOMER_LOOKUP . '</a>';
+                  }
+                  ?>
+                </td>
               </tr>
             </table>
           </div>
           <div class="col-sm-4">
-            <table class="table">
+            <table class="table" id="addressDelivery">
               <tr>
-                <td><strong><?php echo ENTRY_SHIPPING_ADDRESS; ?></strong></td>
+                <td><strong><?php echo ENTRY_SHIPPING_ADDRESS; ?></strong><br>
+                    <?php if (!empty($order->delivery)) { ?>
+                    <button type="button" class="btn btn-xs btn-default mt-3" title="<?= TEXT_COPY ?>" onclick="copyToClipboard('delivery', this)"><?= TEXT_COPY ?></button>
+                    <?php } ?>
+                </td>
                 <td><?php echo (empty($order->delivery)) ? TEXT_NONE : zen_address_format($order->delivery['format_id'], $order->delivery, 1, '', '<br>'); ?></td>
               </tr>
 <?php if (!empty($order->delivery)) { ?>
               <tr>
                 <td>&nbsp;</td>
-                <td class="noprint"><a href="https://maps.google.com/maps/search/?api=1&amp;query=<?php echo urlencode($order->delivery['street_address'] . ',' . $order->delivery['city'] . ',' . $order->delivery['state'] . ',' . $order->delivery['postcode']); ?>" rel="noreferrer" target="map"><i class="fa fa-map">&nbsp;</i> <u><?php echo TEXT_MAP_SHIPPING_ADDRESS; ?></u></a></td>
+                <td class="noprint"><a href="https://maps.google.com/maps/search/?api=1&amp;query=<?php echo urlencode($order->delivery['street_address'] . ',' . $order->delivery['city'] . ',' . $order->delivery['state'] . ',' . $order->delivery['postcode']); ?>" rel="noreferrer" target="map"><i class="fa-regular fa-map">&nbsp;</i> <u><?php echo TEXT_MAP_SHIPPING_ADDRESS; ?></u></a></td>
               </tr>
 <?php
   }
   $address_footer_suffix = '';
   $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_ADDRESS_FOOTERS', 'delivery', $address_footer_suffix, $order->delivery);
-  if (!empty($address_footer_suffix)) {
-  ?>
-                <tr><td>&nbsp;</td><td><?php echo $address_footer_suffix; ?></td></tr>
-<?php } ?>
+    if (is_array($address_footer_suffix)) {
+        foreach ($address_footer_suffix as $label => $data) {
+            ?>
+            <tr>
+                <td><strong><?= $label ?></td>
+                <td><?= $data ?></td>
+            </tr>
+            <?php
+        }
+    } elseif (!empty($address_footer_suffix)) { ?>
+        <tr>
+            <td>&nbsp;</td>
+            <td><?= $address_footer_suffix ?></td>
+        </tr>
+        <?php
+    } ?>
             </table>
           </div>
           <div class="col-sm-4">
-            <table class="table">
+            <table class="table" id="addressBilling">
               <tr>
-                <td><strong><?php echo ENTRY_BILLING_ADDRESS; ?></strong></td>
+                <td><strong><?php echo ENTRY_BILLING_ADDRESS; ?></strong><br>
+                    <button type="button" class="btn btn-xs btn-default mt-3" title="<?= TEXT_COPY ?>" onclick="copyToClipboard('billing', this)"><?= TEXT_COPY ?></button>
+                </td>
                 <td><?php echo zen_address_format($order->billing['format_id'], $order->billing, 1, '', '<br>'); ?></td>
               </tr>
               <tr>
                 <td>&nbsp;</td>
-                <td class="noprint"><a href="https://maps.google.com/maps/search/?api=1&amp;query=<?php echo urlencode($order->billing['street_address'] . ',' . $order->billing['city'] . ',' . $order->billing['state'] . ',' . $order->billing['postcode']); ?>" rel="noreferrer" target="map"><i class="fa fa-map">&nbsp;</i> <u><?php echo TEXT_MAP_BILLING_ADDRESS; ?></u></a></td>
+                <td class="noprint"><a href="https://maps.google.com/maps/search/?api=1&amp;query=<?php echo urlencode($order->billing['street_address'] . ',' . $order->billing['city'] . ',' . $order->billing['state'] . ',' . $order->billing['postcode']); ?>" rel="noreferrer" target="map"><i class="fa-regular fa-map">&nbsp;</i> <u><?php echo TEXT_MAP_BILLING_ADDRESS; ?></u></a></td>
               </tr>
 <?php
   $address_footer_suffix = '';
   $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_ADDRESS_FOOTERS', 'billing', $address_footer_suffix, $order->billing);
-  if (!empty($address_footer_suffix)) {
-  ?>
-                <tr><td>&nbsp;</td><td><?php echo $address_footer_suffix; ?></td></tr>
-<?php } ?>
+if (is_array($address_footer_suffix)) {
+    foreach ($address_footer_suffix as $label => $data) {
+        ?>
+        <tr>
+            <td><strong><?= $label ?></td>
+            <td><?= $data ?></td>
+        </tr>
+        <?php
+    }
+} elseif (!empty($address_footer_suffix)) { ?>
+    <tr>
+        <td>&nbsp;</td>
+        <td><?= $address_footer_suffix ?></td>
+    </tr>
+    <?php
+}
+  // -----
+  // Determine, based on a 'soft' configuration setting in admin/extra_datafiles/site_specific_admin_overrides.php,
+  // whether to display the order's overall and product-specific weights.
+  //
+  // Note: Zen Cart versions *prior to* 1.5.6 stored neither orders::order_weight nor
+  // orders_products::products_weight.  If the order's weight is stored as null, don't
+  // display the weights!
+  //
+  $show_orders_weights = ($order->info['order_weight'] !== null && ((bool)($show_orders_weights ?? true)));
+?>
             </table>
           </div>
         </div>
@@ -781,11 +946,39 @@ if (!$batch_status_update_active) {
               <td class="main"><strong><?php echo ENTRY_DATE_PURCHASED; ?></strong></td>
               <td class="main"><?php echo zen_date_long($order->info['date_purchased']); ?></td>
             </tr>
+<?php
+            // -----
+            // If the order's weight isn't null (the field was added to the stored order in
+            // zc156), display the order's weight.
+            //
+            if ($show_orders_weights === true) {
+?>
+            <tr>
+              <td class="main"><strong><?php echo ENTRY_WEIGHT; ?></strong></td>
+              <td class="main"><?php echo $order->info['order_weight'] . ' ' . ltrim(TEXT_PRODUCT_WEIGHT_UNIT, ' '); ?></td>
+            </tr>
+<?php
+            }
+?>
             <tr>
               <td class="main"><strong><?php echo ENTRY_PAYMENT_METHOD; ?></strong></td>
               <td class="main"><?php echo $order->info['payment_method']; ?></td>
             </tr>
             <?php
+            // -----
+            // Note: Using loose comparison since the value is recorded (currently) as decimal(14,6)
+            // and shows up in the order as (string)1.00000 if the order's placed in the store's
+            // default currency.
+            //
+            if ($order->info['currency_value'] != 1) {
+?>
+            <tr>
+              <td class="main"><strong><?php echo ENTRY_CURRENCY_VALUE; ?></strong></td>
+              <td class="main"><?php echo $order->info['currency_value']; ?></td>
+            </tr>
+<?php
+            }
+
             if (!empty($order->info['cc_type']) || !empty($order->info['cc_owner']) || !empty($order->info['cc_number'])) {
               ?>
               <tr class="noprint">
@@ -835,11 +1028,18 @@ if (!$batch_status_update_active) {
           <?php $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_PAYMENTDATA_COLUMN2', $oID, $order); ?>
         </div>
         <?php
-        if (isset($module) && (is_object($module) && method_exists($module, 'admin_notification'))) {
+        if (isset($module) && (is_object($module) && method_exists($module, 'admin_notification')) && $module->enabled) {
           ?>
-          <div class="row noprint"><?php echo zen_draw_separator('pixel_trans.gif', '1', '10'); ?><br><a href="#" id="payinfo" class="noprint"><?php echo TEXT_ADDITIONAL_PAYMENT_OPTIONS; ?></a></div>
-          <div class="row" id="payment-details-section" style="display: none;"><?php echo $module->admin_notification($oID); ?></div>
-          <div class="row noprint"><?php echo zen_draw_separator('pixel_trans.gif', '1', '10'); ?></div>
+          <br>
+          <div class="row noprint">
+            <a href="javascript:void(0);" class="noprint" data-toggle="collapse" data-target="#payment-details-section">
+                <?php echo TEXT_ADDITIONAL_PAYMENT_OPTIONS; ?>
+            </a>
+          </div>
+          <div class="row collapse" id="payment-details-section">
+            <?php echo $module->admin_notification($oID); ?>
+          </div>
+          <br>
           <?php
         }
         ?>
@@ -849,6 +1049,9 @@ if (!$batch_status_update_active) {
             <tr class="dataTableHeadingRow">
               <th class="dataTableHeadingContent" colspan="2"><?php echo TABLE_HEADING_PRODUCTS_NAME; ?></th>
               <th class="dataTableHeadingContent hidden-xs"><?php echo TABLE_HEADING_PRODUCTS_MODEL; ?></th>
+<?php if ($show_orders_weights === true) { ?>
+              <th class="dataTableHeadingContent text-right"><?php echo TABLE_HEADING_PRODUCTS_WEIGHT; ?></th>
+<?php } ?>
 <?php if ($show_product_tax) { ?>
               <th class="dataTableHeadingContent text-right hidden-xs"><?php echo TABLE_HEADING_TAX; ?></th>
 <?php } ?>
@@ -862,6 +1065,7 @@ if (!$batch_status_update_active) {
 <?php } ?>
             </tr>
             <?php
+            $weight_unit = ' ' . ltrim(TEXT_PRODUCT_WEIGHT_UNIT, ' ');
             for ($i = 0, $n = count($order->products); $i < $n; $i++) {
               if (DISPLAY_PRICE_WITH_TAX_ADMIN === 'true') {
                 $priceIncTax = $currencies->format(zen_round(zen_add_tax($order->products[$i]['final_price'], $order->products[$i]['tax']), $currencies->get_decimal_places($order->info['currency'])) * $order->products[$i]['qty'], true, $order->info['currency'], $order->info['currency_value']);
@@ -877,21 +1081,29 @@ if (!$batch_status_update_active) {
                 <?php
                     echo $order->products[$i]['name'];
                     if (isset($order->products[$i]['attributes']) && (count($order->products[$i]['attributes']) > 0)) {
-                      for ($j = 0, $k = count($order->products[$i]['attributes']); $j < $k; $j++) {
-                        echo '<br><span style="white-space:nowrap;"><small>&nbsp;<i> - ';
-                        echo $order->products[$i]['attributes'][$j]['option'] . ': ' . nl2br(zen_output_string_protected($order->products[$i]['attributes'][$j]['value']));
-                        if (zen_is_option_file($order->products[$i]['attributes'][$j]['option_id'])) {
-                          $upload_name = zen_get_uploaded_file($order->products[$i]['attributes'][$j]['value']);
-                          echo ' ' . '<a href="' . zen_href_link(FILENAME_ORDERS, 'action=download&oID=' . $oID . '&filename=' .  $upload_name) . '">' . TEXT_DOWNLOAD . '</a>' . ' ';
+                        for ($j = 0, $k = count($order->products[$i]['attributes']); $j < $k; $j++) {
+                            echo '<br><span style="white-space:nowrap;"><small>&nbsp;<i> - ';
+                            echo $order->products[$i]['attributes'][$j]['option'] . ': ' . nl2br(zen_output_string_protected($order->products[$i]['attributes'][$j]['value']));
+                            if (zen_is_option_file($order->products[$i]['attributes'][$j]['option_id'])) {
+                                $upload_name = zen_get_uploaded_file($order->products[$i]['attributes'][$j]['value']);
+                                echo ' ' . '<a href="' . zen_href_link(FILENAME_ORDERS, 'action=download&oID=' . $oID . '&filename=' .  $upload_name) . '">' . TEXT_DOWNLOAD . '</a>' . ' ';
+                            }
+                            if ($order->products[$i]['attributes'][$j]['price'] != '0') {
+                                echo ' (' . $order->products[$i]['attributes'][$j]['prefix'] . $currencies->format($order->products[$i]['attributes'][$j]['price'] * $order->products[$i]['qty'], true, $order->info['currency'], $order->info['currency_value']) . ')';
+                            }
+                            if ($order->products[$i]['attributes'][$j]['product_attribute_is_free'] == '1' && $order->products[$i]['product_is_free'] == '1') {
+                                echo TEXT_INFO_ATTRIBUTE_FREE;
+                            }
+                            // -----
+                            // Uncomment the 'echo' statement below if you want to display each attribute's
+                            // contribution to the ordered-product's weight (the weights are already included
+                            // in the product's overall weight).
+                            //
+                            if ($show_orders_weights === true && $order->products[$i]['attributes'][$j]['weight'] != 0) {
+//                                echo ' (' . $order->products[$i]['attributes'][$j]['weight_prefix'] . $order->products[$i]['attributes'][$j]['weight'] . $weight_unit . ')';
+                            }
+                            echo '</i></small></span>';
                         }
-                        if ($order->products[$i]['attributes'][$j]['price'] != '0') {
-                          echo ' (' . $order->products[$i]['attributes'][$j]['prefix'] . $currencies->format($order->products[$i]['attributes'][$j]['price'] * $order->products[$i]['qty'], true, $order->info['currency'], $order->info['currency_value']) . ')';
-                        }
-                        if ($order->products[$i]['attributes'][$j]['product_attribute_is_free'] == '1' && $order->products[$i]['product_is_free'] == '1') {
-                          echo TEXT_INFO_ATTRIBUTE_FREE;
-                        }
-                        echo '</i></small></span>';
-                      }
                     }
                     // Mobile phones only
                     echo '<span class="visible-xs">';
@@ -902,6 +1114,29 @@ if (!$batch_status_update_active) {
                 <td class="dataTableContent hidden-xs">
                   <?php echo $order->products[$i]['model']; ?>
                 </td>
+                <?php
+                    if ($show_orders_weights === true) {
+                        $products_weight_unit = $order->products[$i]['products_weight'];
+                        if ($products_weight_unit === null) {
+                            $products_weight = '&mdash;';
+                        } else {
+                            // ----
+                            // For the total weight, format the value with 4 decimal digits, trimming
+                            // any trailing 0's from the decimals -- e.g. '20.0200' becomes '20.02'.  The
+                            // second rtrim removes a trailing decimal point, in case the overall weight
+                            // is an integral value -- e.g. '20.0000' first becomes '20.' and then '20'.
+                            //
+                            $products_weight_total = rtrim(number_format((float)($products_weight_unit * $order->products[$i]['qty']), 4, '.', ''), '0');
+                            $products_weight_total = rtrim($products_weight_total, '.');
+                            $products_weight = "$products_weight_unit$weight_unit / $products_weight_total$weight_unit";
+                        }
+                ?>
+                <td class="dataTableContent text-right">
+                  <?php echo $products_weight; ?>
+                </td>
+                <?php
+                    }
+                ?>
 <?php if ($show_product_tax) { ?>
                 <td class="dataTableContent text-right hidden-xs">
                   <?php echo zen_display_tax_value($order->products[$i]['tax']); ?>%
@@ -934,11 +1169,16 @@ if (!$batch_status_update_active) {
             ?>
             <tr>
 
-<?php if ($show_including_tax)  { ?>
-              <td colspan="8">
-<?php } else { ?>
-              <td colspan="6">
-<?php } ?>
+<?php
+$base_orders_columns = 6;
+if ($show_including_tax)  {
+    $base_orders_columns += 2;
+}
+if ($show_orders_weights === true) {
+    $base_orders_columns++;
+}
+?>
+              <td colspan="<?php echo $base_orders_columns; ?>">
                 <table style="margin-right: 0; margin-left: auto;">
                     <?php
                     for ($i = 0, $n = count($order->totals); $i < $n; $i++) {
@@ -1012,12 +1252,9 @@ if (!$batch_status_update_active) {
             </thead>
             <tbody>
                 <?php
-                $orders_history = $db->Execute("SELECT *
-                                              FROM " . TABLE_ORDERS_STATUS_HISTORY . "
-                                              WHERE orders_id = " . zen_db_input($oID) . "
-                                              ORDER BY orders_status_history_id");
+                $orders_history = $order->statuses;
 
-                if ($orders_history->RecordCount() > 0) {
+                if (count($orders_history) !== 0) {
                   $first = true;
                   foreach ($orders_history as $item) {
                     ?>
@@ -1026,22 +1263,22 @@ if (!$batch_status_update_active) {
                     <td class="text-center hidden-xs">
                         <?php
                         if ($item['customer_notified'] == '1') {
-                          echo zen_image(DIR_WS_ICONS . 'tick.gif', TEXT_YES);
+                          echo zen_icon('tick', TEXT_YES, 'lg');
                         } elseif ($item['customer_notified'] == '-1') {
-                          echo zen_image(DIR_WS_ICONS . 'locked.gif', TEXT_HIDDEN);
+                          echo zen_icon('locked', TEXT_HIDDEN, 'lg');
                         } else {
-                          echo zen_image(DIR_WS_ICONS . 'unlocked.gif', TEXT_VISIBLE);
+                          echo zen_icon('unlocked', TEXT_VISIBLE, 'lg');
                         }
                         ?>
                     </td>
-                    <td><?php echo $orders_status_array[$item['orders_status_id']]; ?></td>
+                    <td><?php echo $orders_status_array[$item['orders_status_id']] ?? ''; ?></td>
 <?php
                     // -----
                     // A watching observer can provide an associative array in the form:
                     //
                     // $extra_data = array(
                     //     array(
-                    //       'align' => $alignment,    // One of 'center', 'right', or 'left' (optional)
+                    //       'align' => $alignment,    // One of 'center', 'right' or 'left' (optional)
                     //       'text' => $value
                     //     ),
                     // );
@@ -1050,7 +1287,7 @@ if (!$batch_status_update_active) {
                     // multiple observers might be injecting content!
                     //
                     $extra_data = false;
-                    $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_STATUS_HISTORY_EXTRA_COLUMN_DATA', $orders_history->fields, $extra_data);
+                    $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_STATUS_HISTORY_EXTRA_COLUMN_DATA', $item, $extra_data);
                     if (is_array($extra_data)) {
                         foreach ($extra_data as $data_info) {
                             $align = (isset($data_info['align'])) ? (' text-' . $data_info['align']) : '';
@@ -1213,59 +1450,33 @@ if (!$batch_status_update_active) {
         $extra_legends = '';
         $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_MENU_LEGEND', [], $extra_legends);
 ?>
-        <div class="row"><?php echo TEXT_LEGEND . ' ' . zen_image(DIR_WS_IMAGES . 'icon_status_red.gif', TEXT_BILLING_SHIPPING_MISMATCH, 10, 10) . ' ' . TEXT_BILLING_SHIPPING_MISMATCH . $extra_legends; ?></div>
+        <div class="row"><?php echo TEXT_LEGEND . ' ' . zen_icon('status-red', TEXT_BILLING_SHIPPING_MISMATCH) . ' ' . TEXT_BILLING_SHIPPING_MISMATCH . $extra_legends; ?></div>
         <div class="row">
           <div class="col-xs-12 col-sm-12 col-md-9 col-lg-9 configurationColumnLeft">
-<?php // plugin Batch Status Update form
+<?php
+// bof plugin Batch Order Update 9/10
+// form
               if (!empty($_GET['statusFilterSelect'])) {
                   echo zen_draw_form('batchStatusUpdateForm', FILENAME_ORDERS, zen_get_all_get_params(['action', 'oID']) . 'action=batch_update_orders', 'post', 'id="batchStatusUpdateForm"', true);
                   echo zen_draw_hidden_field('admin_language', $_SESSION['languages_code']);
               }
-//eof plugin Batch Status Update form ?>
+// eof plugin Batch Order Update ?>
             <table id="orders-table" class="table table-hover">
               <thead>
                 <tr class="dataTableHeadingRow">
-                    <?php
-// Sort Listing
-                    switch ($_GET['list_order']) {
-                      case "id-asc":
-                        $disp_order = "c.customers_id";
-                        break;
-                      case "firstname":
-                        $disp_order = "c.customers_firstname";
-                        break;
-                      case "firstname-desc":
-                        $disp_order = "c.customers_firstname DESC";
-                        break;
-                      case "lastname":
-                        $disp_order = "c.customers_lastname, c.customers_firstname";
-                        break;
-                      case "lastname-desc":
-                        $disp_order = "c.customers_lastname DESC, c.customers_firstname";
-                        break;
-                      case "company":
-                        $disp_order = "a.entry_company";
-                        break;
-                      case "company-desc":
-                        $disp_order = "a.entry_company DESC";
-                        break;
-                      default:
-                        $disp_order = "c.customers_id DESC";
-                    }
-                    ?>
-                  <td class="dataTableHeadingContent text-center"><?php echo TABLE_HEADING_ORDERS_ID; ?></td>
-                  <td class="dataTableHeadingContent"><?php echo TABLE_HEADING_PAYMENT_METHOD; ?></td>
-                  <td class="dataTableHeadingContent"><?php echo TABLE_HEADING_CUSTOMERS; ?></td>
-<?php if ($show_zone_info) { ?> 
-                  <td class="dataTableHeadingContent"><?php echo TABLE_HEADING_ZONE_INFO; ?></td>
-<?php } ?> 
-                  <td class="dataTableHeadingContent text-right"><?php echo TABLE_HEADING_ORDER_TOTAL; ?></td>
-<?php if ($quick_view_popover_enabled) { ?>
-                  <td></td>
+                  <th class="dataTableHeadingContent text-center"><?php echo TABLE_HEADING_ORDERS_ID; ?></th>
+                  <th class="dataTableHeadingContent"><?php echo TABLE_HEADING_PAYMENT_METHOD; ?></th>
+                  <th class="dataTableHeadingContent"><?php echo TABLE_HEADING_CUSTOMERS; ?></th>
+<?php if ($show_zone_info) { ?>
+                  <th class="dataTableHeadingContent"><?php echo TABLE_HEADING_ZONE_INFO; ?></th>
 <?php } ?>
-                  <td class="dataTableHeadingContent text-center"><?php echo TABLE_HEADING_DATE_PURCHASED; ?></td>
-                  <td class="dataTableHeadingContent text-right"><?php echo TABLE_HEADING_STATUS; ?></td>
-                  <td class="dataTableHeadingContent text-center"><?php echo TABLE_HEADING_CUSTOMER_COMMENTS; ?></td>
+                  <th class="dataTableHeadingContent text-right"><?php echo TABLE_HEADING_ORDER_TOTAL; ?></th>
+<?php if ($quick_view_popover_enabled) { ?>
+                  <th></th>
+<?php } ?>
+                  <th class="dataTableHeadingContent text-center"><?php echo TABLE_HEADING_DATE_PURCHASED; ?></th>
+                  <th class="dataTableHeadingContent text-right"><?php echo TABLE_HEADING_STATUS; ?></th>
+                  <th class="dataTableHeadingContent text-center"><?php echo TABLE_HEADING_CUSTOMER_COMMENTS; ?></th>
 <?php
   // -----
   // A watching observer can provide an associative array in the form:
@@ -1286,12 +1497,12 @@ if (!$batch_status_update_active) {
       foreach ($extra_headings as $heading_info) {
           $align = (isset($heading_info['align'])) ? (' text-' . $heading_info['align']) : '';
 ?>
-                <td class="dataTableHeadingContent<?php echo $align; ?>"><?php echo $heading_info['text']; ?></td>
+                <th class="dataTableHeadingContent<?php echo $align; ?>"><?php echo $heading_info['text']; ?></th>
 <?php
       }
   }
 ?>
-                  <td class="dataTableHeadingContent noprint text-right"><?php echo TABLE_HEADING_ACTION; ?></td>
+                  <th class="dataTableHeadingContent noprint text-right"><?php echo TABLE_HEADING_ACTION; ?></th>
                 </tr>
               </thead>
               <tbody>
@@ -1310,11 +1521,12 @@ if (!$batch_status_update_active) {
                       $keyword_search_fields = [
                           'op.products_name',
                           'op.products_model',
+                          'op.products_id',
                       ];
-                      $search = zen_build_keyword_where_clause($keyword_search_fields, trim($keywords));
+                      $search = zen_build_keyword_where_clause($keyword_search_fields, trim($keywords), true);
                     if (substr(strtoupper($_GET['search_orders_products']), 0, 3) === 'ID:') {
                       $keywords = trim(substr($_GET['search_orders_products'], 3));
-                      $search = " AND op.products_id ='" . (int)$keywords . "'";
+                      $search .= " OR op.products_id ='" . (int)$keywords . "'";
                     }
                   } elseif (!empty($_GET['search'])) {
 // create search filter
@@ -1340,9 +1552,9 @@ if (!$batch_status_update_active) {
                           'o.delivery_postcode',
                           'o.ip_address',
                       ];
-                      $search = zen_build_keyword_where_clause($keyword_search_fields, trim($keywords));
+                      $search = zen_build_keyword_where_clause($keyword_search_fields, trim($keywords), true);
                   }
-                  $new_fields .= ", o.customers_company, o.customers_email_address, o.customers_street_address, o.delivery_company, o.delivery_name, o.delivery_street_address, o.billing_company, o.billing_name, o.billing_street_address, o.payment_module_code, o.shipping_module_code, o.orders_status, o.ip_address, o.language_code, o.delivery_state, o.delivery_country ";
+                  $new_fields .= ", o.customers_company, o.customers_email_address, o.customers_street_address, o.delivery_company, o.delivery_name, o.delivery_street_address, o.delivery_postcode, o.billing_company, o.billing_name, o.billing_street_address, o.billing_postcode, o.payment_module_code, o.shipping_module_code, o.orders_status, o.ip_address, o.language_code, o.delivery_state, o.delivery_country, o.customers_state, o.customers_country ";
 
                   $order_by = " ORDER BY o.orders_id DESC";
                   $zco_notifier->notify('NOTIFY_ADMIN_ORDERS_SEARCH_PARMS', $keywords, $search, $search_distinct, $new_fields, $new_table, $order_by);
@@ -1361,7 +1573,7 @@ if (!$batch_status_update_active) {
                     $status_filter = (int)zen_db_prepare_input($_GET['statusFilterSelect']);
                     $orders_query_raw .= " WHERE s.orders_status_id = " . (int)$status_filter . $search;
                   } else {
-                    $orders_query_raw .= (trim($search) !== '') ? preg_replace('/ *AND /i', ' WHERE ', $search, 1) : '';
+                    $orders_query_raw .= $search;
                   }
 
                   $orders_query_raw .= $order_by;
@@ -1373,10 +1585,10 @@ if (!$batch_status_update_active) {
                     $check_count = 0;
                     if ($check_page->RecordCount() > MAX_DISPLAY_SEARCH_RESULTS_ORDERS) {
                       while (!$check_page->EOF) {
+                        $check_count++;
                         if ($check_page->fields['orders_id'] == $_GET['oID']) {
                           break;
                         }
-                        $check_count++;
                         $check_page->MoveNext();
                       }
                       $_GET['page'] = round((($check_count / MAX_DISPLAY_SEARCH_RESULTS_ORDERS) + (fmod_round($check_count, MAX_DISPLAY_SEARCH_RESULTS_ORDERS) != 0 ? .5 : 0)), 0);
@@ -1401,10 +1613,13 @@ if (!$batch_status_update_active) {
 
                     $show_difference = '';
                     if (!empty($orders->fields['delivery_name']) && (strtoupper($orders->fields['delivery_name']) !== strtoupper($orders->fields['billing_name']))) {
-                      $show_difference = zen_image(DIR_WS_IMAGES . 'icon_status_red.gif', TEXT_BILLING_SHIPPING_MISMATCH, 10, 10) . '&nbsp;';
+                      $show_difference = zen_icon('status-red', TEXT_BILLING_SHIPPING_MISMATCH) . '&nbsp;';
                     }
                     if (!empty($orders->fields['delivery_street_address']) && (strtoupper($orders->fields['delivery_street_address']) !== strtoupper($orders->fields['billing_street_address']))) {
-                      $show_difference = zen_image(DIR_WS_IMAGES . 'icon_status_red.gif', TEXT_BILLING_SHIPPING_MISMATCH, 10, 10) . '&nbsp;';
+                      $show_difference = zen_icon('status-red', TEXT_BILLING_SHIPPING_MISMATCH) . '&nbsp;';
+                    }
+                    if (strtoupper($orders->fields['delivery_postcode']) !== strtoupper($orders->fields['billing_postcode']) && trim($orders->fields['delivery_postcode']) !== '') {
+                      $show_difference = zen_icon('status-red', TEXT_BILLING_SHIPPING_MISMATCH) . '&nbsp;';
                     }
                     //-Additional "difference" icons can be added on a per-order basis and/or additional icons to be added to the "action" column.
                     $extra_action_icons = '';
@@ -1440,19 +1655,24 @@ if (!$batch_status_update_active) {
                     ?>
                 <td class="dataTableContent text-center"><?php echo $show_difference . $orders->fields['orders_id']; ?></td>
                 <td class="dataTableContent"><?php echo $show_payment_type; ?></td>
-                <td class="dataTableContent"><?php echo '<a href="' . zen_href_link(FILENAME_CUSTOMERS, 'cID=' . $orders->fields['customers_id'], 'NONSSL') . '">' . zen_image(DIR_WS_ICONS . 'preview.gif', ICON_PREVIEW . ' ' . TABLE_HEADING_CUSTOMERS) . '</a>&nbsp;' . $orders->fields['customers_name'] . ($orders->fields['customers_company'] !== '' ? '<br>' . $orders->fields['customers_company'] : ''); ?></td>
-<?php if ($show_zone_info) { ?> 
+                <td class="dataTableContent"><?php echo '<a href="' . zen_href_link(FILENAME_CUSTOMERS, 'cID=' . $orders->fields['customers_id'], 'NONSSL') . '"><i class="fa-solid fa-magnifying-glass"></i></a>&nbsp;' . $orders->fields['customers_name'] . ($orders->fields['customers_company'] !== '' ? '<br>' . zen_output_string_protected($orders->fields['customers_company']) : ''); ?></td>
+<?php if ($show_zone_info) { ?>
                 <td class="dataTableContent text-left">
-<?php echo $orders->fields['delivery_state'] . '<br>' . $orders->fields['delivery_country']; ?>
+<?php
+                    if (!empty($orders->fields['delivery_country'])) {
+                       echo zen_output_string_protected($orders->fields['delivery_state']) . '<br>' . zen_output_string_protected($orders->fields['delivery_country']);
+                    } else {
+                       echo zen_output_string_protected($orders->fields['customers_state']) . '<br>' . zen_output_string_protected($orders->fields['customers_country']);
+                    }
+?>
                 </td>
-                </td>
-<?php } ?> 
-                <td class="dataTableContent text-right" title="<?php echo zen_output_string($product_details, ['"' => '&quot;', "'" => '&#39;', '<br />' => '', '<hr>' => "----\n"]); ?>">
+<?php } ?>
+                <td class="dataTableContent text-right" title="<?php echo zen_output_string($product_details, ['"' => '&quot;', "'" => '&#39;', '<br>' => '', '<br />' => '', '<hr>' => "----\n"]); ?>">
                   <?php echo strip_tags($currencies->format($orders->fields['order_total'], true, $orders->fields['currency'], $orders->fields['currency_value'])); ?>
                 </td>
 <?php if ($quick_view_popover_enabled) { ?>
                 <td class="dataTableContent text-right dataTableButtonCell">
-                    <a tabindex="0" class="btn btn-xs btn-link orderProductsPopover" role="button" data-toggle="popover"
+                    <a tabindex="0" class="btn btn-xs btn-link mt-3 orderProductsPopover" role="button" data-toggle="popover"
                        data-trigger="focus"
                        data-placement="left"
                        title="<?php echo TEXT_PRODUCT_POPUP_TITLE; ?>"
@@ -1463,9 +1683,17 @@ if (!$batch_status_update_active) {
                 </td>
 <?php } ?>
                 <td class="dataTableContent text-center"><?php echo zen_datetime_short($orders->fields['date_purchased']); ?></td>
-                <td class="dataTableContent text-right"><?php echo ($orders->fields['orders_status_name'] !== '' ? $orders->fields['orders_status_name'] : TEXT_INVALID_ORDER_STATUS); ?></td>
-                <?php $order_comments = zen_output_string_protected(zen_get_orders_comments($orders->fields['orders_id'])); ?>
-                <td class="dataTableContent text-center"<?php if (!empty($order_comments)) echo ' title="' . $order_comments . '"'; ?>><?php if (!empty($order_comments)) echo zen_image(DIR_WS_IMAGES . 'icon_yellow_on.gif', '', 16, 16); ?></td>
+                <td class="dataTableContent text-right"><?php echo !empty($orders->fields['orders_status_name']) ? $orders->fields['orders_status_name'] : TEXT_INVALID_ORDER_STATUS; ?></td>
+                <?php
+                   $order_comments = zen_output_string_protected(zen_get_orders_comments($orders->fields['orders_id']));
+                   if (!empty($order_comments)) {
+                      echo '<td class="dataTableContent text-center" title="' . $order_comments . '">';
+                      echo zen_image(DIR_WS_IMAGES . 'icon_yellow_on.gif', '', 16, 16);
+                      echo '</td>';
+                   } else {
+                     echo '<td class="dataTableContent text-center"></td>';
+                   }
+                ?>
 <?php
   // -----
   // A watching observer can provide an associative array in the form:
@@ -1492,16 +1720,19 @@ if (!$batch_status_update_active) {
   }
 ?>
 
-                <td class="dataTableContent noprint text-right dataTableButtonCell">
+                <td class="dataTableContent noprint text-right actions dataTableButtonCell">
+                  <div class="btn-group">
                     <?php
-                    echo '<a href="' . zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID', 'action']) . 'oID=' . $orders->fields['orders_id'] . '&action=edit', 'NONSSL') . '">' . zen_image(DIR_WS_IMAGES . 'icon_edit.gif', ICON_EDIT) . '</a>' . $extra_action_icons;
+                    echo '<a href="' . zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID', 'action']) . 'oID=' . $orders->fields['orders_id'] . '&action=edit', 'NONSSL') . '" class="btn btn-sm btn-default btn-edit" data-toggle="tooltip" title="' . ICON_EDIT . '">' .
+                      zen_icon('pencil', hidden: true) .
+                    '</a>' . $extra_action_icons;
                     ?>
-                    &nbsp;
+                    </div>
                     <?php
                     if (isset($oInfo) && is_object($oInfo) && ($orders->fields['orders_id'] == $oInfo->orders_id)) {
-                      echo zen_image(DIR_WS_IMAGES . 'icon_arrow_right.gif');
+                      echo zen_icon('caret-right', '', '2x', true);
                     } else {
-                      echo '<a href="' . zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID']) . 'oID=' . $orders->fields['orders_id'], 'NONSSL') . '">' . zen_image(DIR_WS_IMAGES . 'icon_info.gif', IMAGE_ICON_INFO) . '</a>';
+                      echo '<a href="' . zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID']) . 'oID=' . $orders->fields['orders_id'], 'NONSSL') . '" data-toggle="tooltip" title="' . IMAGE_ICON_INFO . '" role="button">' . zen_icon('circle-info', '', '2x', true, false) . '</a>';
                     }
                     ?>&nbsp;</td>
                 </tr>
@@ -1511,10 +1742,13 @@ if (!$batch_status_update_active) {
               ?>
               </tbody>
             </table>
-<?php //plugin Batch Status Update form end
+<?php
+// bof plugin Batch Order Update 10/10
+// form end
 if (!empty($_GET['statusFilterSelect'])) {
     echo '</form>';
-}//eof plugin Batch Status Update form end ?>
+}
+// eof plugin Batch Order Update ?>
             <table class="table">
               <tr>
                   <td><?php echo $orders_split->display_count($orders_query_numrows, MAX_DISPLAY_SEARCH_RESULTS_ORDERS, $_GET['page'], TEXT_DISPLAY_NUMBER_OF_ORDERS); ?></td>
@@ -1551,8 +1785,8 @@ if (!empty($_GET['statusFilterSelect'])) {
 
                   $contents = ['form' => zen_draw_form('orders', FILENAME_ORDERS, zen_get_all_get_params(['oID', 'action']) . '&action=deleteconfirm', 'post', 'class="form-horizontal"', true) . zen_draw_hidden_field('oID', $oInfo->orders_id)];
 //      $contents[] = array('text' => TEXT_INFO_DELETE_INTRO . '<br><br><strong>' . $cInfo->customers_firstname . ' ' . $cInfo->customers_lastname . '</strong>');
-                  $contents[] = ['text' => TEXT_INFO_DELETE_INTRO . '<br><br><strong>' . ENTRY_ORDER_ID . $oInfo->orders_id . '<br>' . $oInfo->order_total . '<br>' . $oInfo->customers_name . ($oInfo->customers_company !== '' ? '<br>' . $oInfo->customers_company : '') . '</strong>'];
-                  $contents[] = ['text' => '<br><label>' . zen_draw_checkbox_field('restock') . ' ' . TEXT_INFO_RESTOCK_PRODUCT_QUANTITY . '</label>'];
+                  $contents[] = ['text' => TEXT_INFO_DELETE_INTRO . '<br><br><strong>' . ENTRY_ORDER_ID . $oInfo->orders_id . '<br>' . $oInfo->order_total . '<br>' . $oInfo->customers_name . ($oInfo->customers_company !== '' ? '<br>' . zen_output_string_protected($oInfo->customers_company) : '') . '</strong>'];
+                  $contents[] = ['text' => '<br><label>' . zen_draw_checkbox_field('restock', 'on') . ' ' . TEXT_INFO_RESTOCK_PRODUCT_QUANTITY . '</label>'];
                   $contents[] = ['align' => 'text-center', 'text' => '<br><button type="submit" class="btn btn-danger">' . IMAGE_DELETE . '</button> <a href="' . zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID', 'action']) . 'oID=' . $oInfo->orders_id, 'NONSSL') . '" class="btn btn-default" role="button">' . IMAGE_CANCEL . '</a>'];
                   break;
                 default:
@@ -1575,7 +1809,7 @@ if (!empty($_GET['statusFilterSelect'])) {
                         '</fieldset></form>' . "\n"];
 
                     $contents[] = ['text' => '<br>' . TEXT_DATE_ORDER_CREATED . ' ' . zen_date_short($oInfo->date_purchased)];
-                    $contents[] = ['text' => '<br>' . $oInfo->customers_email_address];
+                    $contents[] = ['text' => '<br>' . '<a href="' . zen_href_link(FILENAME_CUSTOMERS, 'cID=' . $oInfo->customers_id, 'NONSSL') . '">' . $oInfo->customers_email_address . '</a>' ];
                     $contents[] = ['text' => TEXT_INFO_IP_ADDRESS . ' ' . $oInfo->ip_address];
                     if (zen_not_null($oInfo->last_modified)) {
                       $contents[] = ['text' => TEXT_DATE_ORDER_LAST_MODIFIED . ' ' . zen_date_short($oInfo->last_modified)];
@@ -1596,14 +1830,24 @@ if (!empty($_GET['statusFilterSelect'])) {
                     }
 
                     // indicate if comments exist
-                    $orders_history_query = $db->Execute("SELECT orders_status_id, date_added, customer_notified, comments
-                                                          FROM " . TABLE_ORDERS_STATUS_HISTORY . "
-                                                          WHERE orders_id = " . (int)$oInfo->orders_id . "
-                                                          AND comments != ''");
+                    $orders_history_query = $db->Execute(
+                        "SELECT comments, updated_by
+                           FROM " . TABLE_ORDERS_STATUS_HISTORY . "
+                          WHERE orders_id = " . (int)$oInfo->orders_id . "
+                            AND comments != ''
+                          ORDER BY date_added ASC
+                          LIMIT 1"
+                    );
 
-                    if ($orders_history_query->RecordCount() > 0) {
+                    if (!$orders_history_query->EOF) {
                       $contents[] = ['text' => '<br>' . TABLE_HEADING_COMMENTS];
-                      $contents[] = ['text' => nl2br(zen_output_string_protected($orders_history_query->fields['comments']))];
+
+                      // -----
+                      // If the first comment was made by the customer, protect the output (no HTML); otherwise, HTML was entered
+                      // by an admin or 'known' process so it's OK.
+                      //
+                      $protected = $orders_history_query->fields['updated_by'] === '';
+                      $contents[] = ['text' => nl2br(zen_output_string($orders_history_query->fields['comments'], false, $protected))];
                     }
 
                     $contents[] = ['text' => '<br>' . zen_image(DIR_WS_IMAGES . 'pixel_black.gif', '', '', '3', 'style="width:100%"')];
@@ -1648,11 +1892,6 @@ if (!empty($_GET['statusFilterSelect'])) {
 
     <!--  enable on-page script tools -->
     <script>
-        jQuery(document).ready(function() {
-            jQuery("#payinfo").click(function () {
-                jQuery("#payment-details-section").toggle()
-            });
-        });
         <?php
         $order_link = str_replace('&amp;', '&', zen_href_link(FILENAME_ORDERS, zen_get_all_get_params(['oID', 'action']) . "oID=[*]"));
         ?>
@@ -1663,35 +1902,6 @@ if (!empty($_GET['statusFilterSelect'])) {
             }));
             jQuery('[data-toggle="popover"]').popover({html:true,sanitize: true});
         })
-        <?php //plugin Batch Status Update: select all checkboxes
-         if (!empty($_GET['statusFilterSelect'])) { ?>
-            $('#batchSelectAll').on('click', function (e) {
-            $('[id^=batchStatusUpdateCheckbox_]').prop('checked', $(e.target).prop('checked'));
-        });
-        //Batch Status Update: prevent Submit if no checkbox is selected or no status selected
-        $("#batchStatusUpdateForm").submit(function (event) {
-            let checkboxSelected = false;
-            let statusSelected = false;
-            let message = '';
-            if ($('.batchStatusUpdateCheckbox:checked').length) {
-                checkboxSelected = true;
-            } else {
-                message = ("<?php echo TEXT_BATCH_NO_CHECKBOX_SELECTED; ?>");
-            }
-            if ($("#statusUpdateSelectBatch").val() === '') {
-                message += ("\n" + "<?php echo TEXT_BATCH_NO_STATUS_SELECTED; ?>");
-            } else {
-                statusSelected = true;
-            }
-            if (checkboxSelected && statusSelected) {
-                //alert("allowed");
-                //event.preventDefault();
-            } else {
-                alert(message);
-                event.preventDefault();
-            }
-        });
-        <?php } // eof Batch Status Update ?>
     </script>
 
 
