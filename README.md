@@ -2,6 +2,8 @@
 
 https://github.com/torvista/Zen_Cart-Batch_Order_Update
 
+https://www.zen-cart.com/showthread.php?228192-Batch-Order-Status-Update
+
 ## Function
 This is an Admin plugin for the Orders page.
 It allows you to select multiple orders (of the same status) and update them to a different status with one action.
